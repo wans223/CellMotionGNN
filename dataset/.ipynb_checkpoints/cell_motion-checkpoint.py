@@ -20,7 +20,7 @@ class CellMotionBase():
     处理时间序列的细胞位置和邻接关系数据
     """
 
-    def __init__(self, max_epochs=1, files=None, sequence_length=50, enable_shuffle=True):
+    def __init__(self, max_epochs=1, files=None, sequence_length=50, enable_shuffle=True, predict_steps=1):
         """
         初始化细胞运动数据集基类
         
@@ -34,6 +34,7 @@ class CellMotionBase():
         self.file_handle = files  # HDF5文件句柄
         self.sequence_length = sequence_length  # 输入序列长度
         self.enable_shuffle = enable_shuffle  # 是否启用shuffle
+        self.predict_steps = predict_steps  # 需要预测的未来步数
         
         if self.enable_shuffle:
             self.shuffle_file()  # 打乱文件顺序
@@ -72,8 +73,8 @@ class CellMotionBase():
                 
                 self.opened_tra.append(tra_index)
                 self.opened_tra_readed_index[tra_index] = -1
-                # 生成随机帧顺序（确保有足够的帧用于序列）
-                valid_start_frames = tra_len - self.sequence_length - 1
+                # 生成随机帧顺序（确保有足够的帧用于序列和未来预测）
+                valid_start_frames = tra_len - self.sequence_length - self.predict_steps
                 if valid_start_frames > 0:
                     self.opened_tra_readed_random_index[tra_index] = np.random.permutation(valid_start_frames)
                 else:
@@ -97,7 +98,7 @@ class CellMotionBase():
         # 找出所有已读完的轨迹
         for tra in self.opened_tra:
             tra_len = self.tra_lengths.get(tra, 0)
-            valid_frames = tra_len - self.sequence_length - 1
+            valid_frames = tra_len - self.sequence_length - self.predict_steps
             if self.opened_tra_readed_index[tra] >= (valid_frames - 1):
                 to_del.append(tra)
         
@@ -160,6 +161,7 @@ class CellMotionBase():
         pos_target = datas['pos_target']  # (N, 2)
         edge_index = datas['edge_index']  # (2, E)
         time = datas['time']
+        pos_future = datas.get('future_pos', None)
         
         num_nodes = pos_sequence.shape[1]
         seq_len = pos_sequence.shape[0]
@@ -179,6 +181,8 @@ class CellMotionBase():
         edge_index = torch.as_tensor(edge_index, dtype=torch.long)
         pos_target = torch.as_tensor(pos_target, dtype=torch.float32)
         pos = torch.as_tensor(pos_sequence[-1], dtype=torch.float32)  # 当前位置
+        if pos_future is not None:
+            pos_future = torch.as_tensor(pos_future, dtype=torch.float32)
         
         # 创建图数据对象
         g = Data(
@@ -187,6 +191,9 @@ class CellMotionBase():
             y=pos_target,  # 目标位置
             pos=pos  # 当前位置（用于可视化）
         )
+        
+        if pos_future is not None:
+            pos_future = torch.as_tensor(pos_future, dtype=torch.float32).transpose(0, 1)
         
         return g
 
@@ -235,11 +242,14 @@ class CellMotionBase():
             dtype=np.float32
         )  # (sequence_length, N, 2)
         
-        # pos_target: 下一帧的位置
-        pos_target = np.array(
-            data['pos'][selected_start_frame + self.sequence_length],
+        # future positions: sequence_length 之后的多步位置
+        future_start = selected_start_frame + self.sequence_length
+        future_end = future_start + self.predict_steps
+        pos_future = np.array(
+            data['pos'][future_start:future_end],
             dtype=np.float32
-        )  # (N, 2)
+        )
+        pos_target = pos_future[0]  # (N, 2)
         
         # edge_index: 邻接关系（假设在整个轨迹中保持不变）
         edge_index = np.array(data['edge_index'], dtype=np.int64)  # (2, E)
@@ -252,7 +262,8 @@ class CellMotionBase():
             'pos_sequence': pos_sequence,
             'pos_target': pos_target,
             'edge_index': edge_index,
-            'time': time
+            'time': time,
+            'future_pos': pos_future
         }
         
         # 转换为图数据格式
@@ -272,7 +283,7 @@ class CellMotion(IterableDataset):
     支持多进程数据加载
     """
     
-    def __init__(self, max_epochs, dataset_dir, split='train', sequence_length=10):
+    def __init__(self, max_epochs, dataset_dir, split='train', sequence_length=10, predict_steps=1):
         """
         初始化细胞运动数据集
         
@@ -288,6 +299,7 @@ class CellMotion(IterableDataset):
         self.max_epochs = max_epochs
         self.dataset_dir = dataset_path
         self.sequence_length = sequence_length
+        self.predict_steps = predict_steps
         
         assert os.path.isfile(dataset_path), f'{dataset_path} not exist'
         
@@ -325,7 +337,8 @@ class CellMotion(IterableDataset):
         return CellMotionBase(
             max_epochs=self.max_epochs,
             files=files,
-            sequence_length=self.sequence_length
+            sequence_length=self.sequence_length,
+            predict_steps=self.predict_steps
         )
 
 
@@ -336,7 +349,7 @@ class CellMotionRollout(IterableDataset):
     按顺序遍历完整的轨迹序列
     """
     
-    def __init__(self, dataset_dir, split='test', sequence_length=10):
+    def __init__(self, dataset_dir, split='test', sequence_length=10, predict_steps=1):
         """
         初始化细胞运动rollout数据集
         
@@ -348,6 +361,7 @@ class CellMotionRollout(IterableDataset):
         dataset_path = osp.join(dataset_dir, split + '.h5')
         self.dataset_dir = dataset_path
         self.sequence_length = sequence_length
+        self.predict_steps = predict_steps
         
         assert os.path.isfile(dataset_path), f'{dataset_path} not exist'
         
@@ -400,8 +414,8 @@ class CellMotionRollout(IterableDataset):
         if self.cur_tra is None:
             raise StopIteration
         
-        # 如果已到达轨迹末尾（需要预留足够的序列长度）
-        if self.cur_trajectory_index >= (self.cur_trajectory_length - self.sequence_length):
+        # 如果已到达轨迹末尾（需要预留足够的序列长度和未来帧）
+        if self.cur_trajectory_index >= (self.cur_trajectory_length - self.sequence_length - self.predict_steps + 1):
             raise StopIteration
         
         data = self.cur_tra
@@ -413,11 +427,14 @@ class CellMotionRollout(IterableDataset):
             dtype=np.float32
         )
         
-        # 目标位置
-        pos_target = np.array(
-            data['pos'][start_frame + self.sequence_length],
+        # 未来位置序列
+        future_start = start_frame + self.sequence_length
+        future_end = future_start + self.predict_steps
+        pos_future = np.array(
+            data['pos'][future_start:future_end],
             dtype=np.float32
         )
+        pos_target = pos_future[0]
         
         # 邻接关系
         edge_index = np.array(data['edge_index'], dtype=np.int64)
@@ -433,7 +450,8 @@ class CellMotionRollout(IterableDataset):
             'pos_sequence': pos_sequence,
             'pos_target': pos_target,
             'edge_index': edge_index,
-            'time': time
+            'time': time,
+            'future_pos': pos_future
         }
         
         # 转换为图数据格式

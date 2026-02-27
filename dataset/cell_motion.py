@@ -193,7 +193,7 @@ class CellMotionBase():
         )
         
         if pos_future is not None:
-            g.future_pos = pos_future
+            pos_future = torch.as_tensor(pos_future, dtype=torch.float32).transpose(0, 1)
         
         return g
 
